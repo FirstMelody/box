@@ -388,6 +388,141 @@ cnip_force_proxy_uid_list_has_entries() {
   [ -s "${cnip_force_proxy_uid_list}" ]
 }
 
+whitelist_owner_list_has_entries() {
+  uid_list_has_entries || [ "${gid_list}" != "" ]
+}
+
+add_guard_port() {
+  local port="$1"
+  case "${port}" in
+    ''|*[!0-9]*)
+      return 0
+      ;;
+  esac
+  [ "${port}" -gt 0 ] 2>/dev/null || return 0
+  [ "${port}" -le 65535 ] 2>/dev/null || return 0
+  case " ${guard_ports} " in
+    *" ${port} "*)
+      ;;
+    *)
+      guard_ports="${guard_ports} ${port}"
+      ;;
+  esac
+}
+
+collect_guard_ports() {
+  guard_ports=""
+
+  add_guard_port "${tproxy_port}"
+  add_guard_port "${redir_port}"
+  add_guard_port "${mihomo_dns_port}"
+
+  if [ "${bin_name}" = "mihomo" ] && [ -f "${mihomo_config}" ]; then
+    local port
+
+    port=$(busybox awk '!/^ *#/ && /^mixed-port:/ {print $2; exit}' "${mihomo_config}" 2>/dev/null)
+    add_guard_port "${port}"
+
+    port=$(busybox awk '!/^ *#/ && /^socks-port:/ {print $2; exit}' "${mihomo_config}" 2>/dev/null)
+    add_guard_port "${port}"
+
+    port=$(busybox awk '!/^ *#/ && /^port:/ {print $2; exit}' "${mihomo_config}" 2>/dev/null)
+    add_guard_port "${port}"
+
+    port=$(busybox awk '!/^ *#/ && /^external-controller:/ {print $2; exit}' "${mihomo_config}" 2>/dev/null | sed "s/[\"']//g" | busybox grep -Eo '[0-9]+$' | head -n 1)
+    add_guard_port "${port}"
+  fi
+}
+
+append_whitelist_port_guard_owner_rules() {
+  local table_name="$1"
+  local chain_name="$2"
+
+  ensure_rule_insert "${table_name}" "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner 0 -j RETURN
+  ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner 1052 -j RETURN
+
+  if uid_list_has_entries; then
+    while read -r appid; do
+      case "${appid}" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      ensure_rule_append "${table_name}" "${chain_name}" -m owner --uid-owner "${appid}" -j RETURN
+    done < "${uid_list}"
+  fi
+
+  if [ "${gid_list}" != "" ]; then
+    for gid in ${gid_list[@]} ; do
+      case "${gid}" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      ensure_rule_append "${table_name}" "${chain_name}" -m owner --gid-owner "${gid}" -j RETURN
+    done
+  fi
+}
+
+apply_whitelist_port_guard() {
+  [[ "${proxy_mode}" == @(whitelist|white) ]] || return 0
+  [[ "${network_mode}" == @(tproxy|enhance) ]] || return 0
+
+  if ! whitelist_owner_list_has_entries; then
+    [ "${iptables}" = "$IPV" ] && log Warning "whitelist port guard skipped: empty UID/GID whitelist"
+    return 0
+  fi
+
+  ensure_chain filter BOX_PORT_GUARD
+  append_whitelist_port_guard_owner_rules filter BOX_PORT_GUARD
+
+  collect_guard_ports
+  if [ -z "${guard_ports}" ]; then
+    [ "${iptables}" = "$IPV" ] && log Warning "whitelist port guard skipped: no local ports collected"
+    ensure_jump filter OUTPUT BOX_PORT_GUARD
+    return 0
+  fi
+
+  local port
+  local local_ip
+  local local_ips=""
+  local reject_tcp_with="tcp-reset"
+  local reject_udp_with="icmp-port-unreachable"
+
+  if [ "${iptables}" = "$IP6V" ]; then
+    reject_udp_with="icmp6-port-unreachable"
+    local_ips=$(ip -6 a | busybox awk '/inet6 / { split($2,a,"/"); print a[1] }' | busybox grep -v '^::1$' | busybox grep -v '^fe80')
+    for port in ${guard_ports}; do
+      ensure_rule_append filter BOX_PORT_GUARD -d ::1 -p tcp --dport "${port}" -j REJECT --reject-with "${reject_tcp_with}"
+      ensure_rule_append filter BOX_PORT_GUARD -d ::1 -p udp --dport "${port}" -j REJECT --reject-with "${reject_udp_with}"
+      for local_ip in ${local_ips}; do
+        ensure_rule_append filter BOX_PORT_GUARD -d "${local_ip}" -p tcp --dport "${port}" -j REJECT --reject-with "${reject_tcp_with}"
+        ensure_rule_append filter BOX_PORT_GUARD -d "${local_ip}" -p udp --dport "${port}" -j REJECT --reject-with "${reject_udp_with}"
+      done
+    done
+  else
+    local_ips=$(ip -4 a | busybox awk '/inet / { split($2,a,"/"); print a[1] }' | busybox grep -v '^127.0.0.1$')
+    for port in ${guard_ports}; do
+      ensure_rule_append filter BOX_PORT_GUARD -d 127.0.0.1 -p tcp --dport "${port}" -j REJECT --reject-with "${reject_tcp_with}"
+      ensure_rule_append filter BOX_PORT_GUARD -d 127.0.0.1 -p udp --dport "${port}" -j REJECT --reject-with "${reject_udp_with}"
+      for local_ip in ${local_ips}; do
+        ensure_rule_append filter BOX_PORT_GUARD -d "${local_ip}" -p tcp --dport "${port}" -j REJECT --reject-with "${reject_tcp_with}"
+        ensure_rule_append filter BOX_PORT_GUARD -d "${local_ip}" -p udp --dport "${port}" -j REJECT --reject-with "${reject_udp_with}"
+      done
+    done
+  fi
+
+  ensure_rule_append filter BOX_PORT_GUARD -j RETURN
+  ensure_jump filter OUTPUT BOX_PORT_GUARD
+  [ "${iptables}" = "$IPV" ] && log Info "whitelist port guard enabled: ${guard_ports}"
+}
+
+cleanup_whitelist_port_guard() {
+  del_jump_silent filter OUTPUT BOX_PORT_GUARD
+  cleanup_chain_fast filter BOX_PORT_GUARD
+}
+
 trim_value() {
   printf '%s' "$1" | busybox sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
@@ -489,6 +624,77 @@ setup_nat_dns_forward() {
   ensure_jump nat OUTPUT "${chain_name}"
 }
 
+setup_nat_dns_forward_external_only() {
+  local chain_name="$1"
+  local dns_port="$2"
+  local family="$3"
+
+  ensure_chain nat "${chain_name}"
+  ensure_rule_insert nat "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  if [ "${family}" = "4" ] && [ "${ignore_ap_list}" != "" ]; then
+    for ignore in ${ignore_ap_list[@]} ; do
+      ensure_rule_append nat "${chain_name}" -i "${ignore}" -j RETURN
+    done
+  fi
+  if dns_udp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -j REDIRECT --to-ports "${dns_port}"
+  fi
+  ensure_jump nat PREROUTING "${chain_name}"
+}
+
+setup_nat_dns_whitelist_output() {
+  local chain_name="$1"
+  local dns_port="$2"
+  local protocol_mode="${3:-both}"
+
+  ensure_chain nat "${chain_name}"
+  ensure_rule_insert nat "${chain_name}" -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+
+  if uid_list_has_entries; then
+    while read -r appid; do
+      case "${appid}" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      if [ "${protocol_mode}" != "udp" ] && dns_tcp_enabled; then
+        ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -m owner --uid-owner "${appid}" -j REDIRECT --to-ports "${dns_port}"
+      fi
+      if dns_udp_enabled; then
+        ensure_rule_append nat "${chain_name}" -p udp --dport 53 -m owner --uid-owner "${appid}" -j REDIRECT --to-ports "${dns_port}"
+      fi
+    done < "${uid_list}"
+  fi
+
+  if [ "${protocol_mode}" != "udp" ] && dns_tcp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -m owner --uid-owner 0 -j REDIRECT --to-ports "${dns_port}"
+    ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -m owner --uid-owner 1052 -j REDIRECT --to-ports "${dns_port}"
+  fi
+  if dns_udp_enabled; then
+    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -m owner --uid-owner 0 -j REDIRECT --to-ports "${dns_port}"
+    ensure_rule_append nat "${chain_name}" -p udp --dport 53 -m owner --uid-owner 1052 -j REDIRECT --to-ports "${dns_port}"
+  fi
+
+  if [ "${gid_list}" != "" ]; then
+    for gid in ${gid_list[@]} ; do
+      case "${gid}" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      if [ "${protocol_mode}" != "udp" ] && dns_tcp_enabled; then
+        ensure_rule_append nat "${chain_name}" -p tcp --dport 53 -m owner --gid-owner "${gid}" -j REDIRECT --to-ports "${dns_port}"
+      fi
+      if dns_udp_enabled; then
+        ensure_rule_append nat "${chain_name}" -p udp --dport 53 -m owner --gid-owner "${gid}" -j REDIRECT --to-ports "${dns_port}"
+      fi
+    done
+  fi
+
+  ensure_rule_append nat "${chain_name}" -j RETURN
+  ensure_jump nat OUTPUT "${chain_name}"
+}
+
 ensure_dns_nat_hijack() {
   dns_mode_is_redirect || dns_should_use_mihomo_forward || return 0
   if [ "${iptables}" = "$IP6V" ] && ! ip6_nat_supported; then
@@ -501,6 +707,19 @@ ensure_dns_nat_hijack() {
   if [ "${iptables}" = "$IP6V" ]; then
     chain_name="NAT_DNS_HIJACK6"
     family="6"
+  fi
+
+  if [ "${iptables}" = "$IPV" ] && [[ "${proxy_mode}" == @(whitelist|white) ]] && whitelist_owner_list_has_entries; then
+    if dns_mode_is_redirect; then
+      setup_nat_dns_whitelist_output "${chain_name}" "$(dns_target_port)" both
+      [ "${iptables}" = "$IPV" ] && log Info "DNS hijack limited to whitelist UID/GID (redirect)"
+      return 0
+    fi
+
+    setup_nat_dns_forward_external_only "NAT_DNS_FORWARD" "$(dns_target_port)" "${family}"
+    setup_nat_dns_whitelist_output "NAT_DNS_FORWARD_LOCAL" "$(dns_target_port)" udp
+    [ "${iptables}" = "$IPV" ] && log Info "DNS hijack limited to whitelist UID/GID (forward)"
+    return 0
   fi
 
   if dns_mode_is_redirect; then
@@ -982,15 +1201,93 @@ cleanup_loopback_reject_rule() {
 apply_quic_block_rules() {
   [ "${quic}" = "disable" ] || return 0
   [ "${proxy_udp}" = "true" ] || return 0
-  ensure_rule_append filter OUTPUT -p udp --dport 443 -j REJECT
-  ensure_rule_append filter OUTPUT -p udp --dport 80 -j REJECT
+  local quic_reject_with="icmp-port-unreachable"
+  [ "${iptables}" = "$IP6V" ] && quic_reject_with="icmp6-port-unreachable"
+
+  if [[ "${proxy_mode}" == @(whitelist|white) ]] && whitelist_owner_list_has_entries; then
+    if uid_list_has_entries; then
+      while read -r appid; do
+        case "${appid}" in
+          ''|*[!0-9]*)
+            continue
+            ;;
+        esac
+        ensure_rule_append filter OUTPUT -p udp -m owner --uid-owner "${appid}" --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+        ensure_rule_append filter OUTPUT -p udp -m owner --uid-owner "${appid}" --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+      done < "${uid_list}"
+    fi
+
+    ensure_rule_append filter OUTPUT -p udp -m owner --uid-owner 0 --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+    ensure_rule_append filter OUTPUT -p udp -m owner --uid-owner 0 --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+    ensure_rule_append filter OUTPUT -p udp -m owner --uid-owner 1052 --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+    ensure_rule_append filter OUTPUT -p udp -m owner --uid-owner 1052 --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+
+    if [ "${gid_list}" != "" ]; then
+      for gid in ${gid_list[@]} ; do
+        case "${gid}" in
+          ''|*[!0-9]*)
+            continue
+            ;;
+        esac
+        ensure_rule_append filter OUTPUT -p udp -m owner --gid-owner "${gid}" --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+        ensure_rule_append filter OUTPUT -p udp -m owner --gid-owner "${gid}" --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+      done
+    fi
+
+    [ "${iptables}" = "$IPV" ] && log Warning "QUIC blocked for whitelist UID/GID only"
+    return 0
+  fi
+  ensure_rule_append filter OUTPUT -p udp --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+  ensure_rule_append filter OUTPUT -p udp --dport 80 -j REJECT --reject-with "${quic_reject_with}"
   [ "${iptables}" = "$IPV" ] && log Warning "已禁用 QUIC"
 }
 
 cleanup_quic_block_rules() {
+  local quic_reject_with="icmp-port-unreachable"
+  [ "${iptables}" = "$IP6V" ] && quic_reject_with="icmp6-port-unreachable"
+
   del_rule_silent filter OUTPUT -p udp -m multiport --dport 443,80 -j REJECT
   del_rule_silent filter OUTPUT -p udp --dport 443 -j REJECT
   del_rule_silent filter OUTPUT -p udp --dport 80 -j REJECT
+  del_rule_silent filter OUTPUT -p udp --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+  del_rule_silent filter OUTPUT -p udp --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+
+  if uid_list_has_entries; then
+    while read -r appid; do
+      case "${appid}" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      del_rule_silent filter OUTPUT -p udp -m owner --uid-owner "${appid}" --dport 443 -j REJECT
+      del_rule_silent filter OUTPUT -p udp -m owner --uid-owner "${appid}" --dport 80 -j REJECT
+      del_rule_silent filter OUTPUT -p udp -m owner --uid-owner "${appid}" --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+      del_rule_silent filter OUTPUT -p udp -m owner --uid-owner "${appid}" --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+    done < "${uid_list}"
+  fi
+
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 0 --dport 443 -j REJECT
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 0 --dport 80 -j REJECT
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 1052 --dport 443 -j REJECT
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 1052 --dport 80 -j REJECT
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 0 --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 0 --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 1052 --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+  del_rule_silent filter OUTPUT -p udp -m owner --uid-owner 1052 --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+
+  if [ "${gid_list}" != "" ]; then
+    for gid in ${gid_list[@]} ; do
+      case "${gid}" in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      del_rule_silent filter OUTPUT -p udp -m owner --gid-owner "${gid}" --dport 443 -j REJECT
+      del_rule_silent filter OUTPUT -p udp -m owner --gid-owner "${gid}" --dport 80 -j REJECT
+      del_rule_silent filter OUTPUT -p udp -m owner --gid-owner "${gid}" --dport 443 -j REJECT --reject-with "${quic_reject_with}"
+      del_rule_silent filter OUTPUT -p udp -m owner --gid-owner "${gid}" --dport 80 -j REJECT --reject-with "${quic_reject_with}"
+    done
+  fi
 }
 
 cleanup_dns_nat_hijack_chains() {
@@ -1001,6 +1298,8 @@ cleanup_dns_nat_hijack_chains() {
     del_jump_silent nat PREROUTING NAT_DNS_FORWARD
     del_jump_silent nat OUTPUT NAT_DNS_FORWARD
     cleanup_chain_fast nat NAT_DNS_FORWARD
+    del_jump_silent nat OUTPUT NAT_DNS_FORWARD_LOCAL
+    cleanup_chain_fast nat NAT_DNS_FORWARD_LOCAL
   else
     del_jump_silent nat PREROUTING NAT_DNS_HIJACK6
     del_jump_silent nat OUTPUT NAT_DNS_HIJACK6
@@ -2031,6 +2330,7 @@ start_redirect() {
 }
 
 stop_redirect() {
+  cleanup_whitelist_port_guard
   cleanup_loopback_reject_rule "${redir_port}"
 
   cleanup_external_chain_common nat BOX_EXTERNAL
@@ -2055,6 +2355,7 @@ start_tproxy() {
   setup_tproxy_divert_chain
 
   apply_quic_block_rules
+  apply_whitelist_port_guard
 
   if [ ${network_mode} != "enhance" ]; then
     # 阻止本地直接访问 TPROXY 端口，避免流量回环。
@@ -2079,6 +2380,7 @@ stop_tproxy() {
   cleanup_tproxy_divert_chain
 
   cleanup_quic_block_rules
+  cleanup_whitelist_port_guard
 
   cleanup_loopback_reject_rule "${tproxy_port}"
 
