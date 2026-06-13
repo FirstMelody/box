@@ -23,6 +23,8 @@ proxy_tcp=${proxy_tcp:-"true"}
 proxy_udp=${proxy_udp:-"true"}
 dns_hijack_tcp=${dns_hijack_tcp:-"true"}
 dns_hijack_udp=${dns_hijack_udp:-"true"}
+tun_force_proxy_cidrs=(${tun_force_proxy_cidrs[@]})
+tun_force_proxy_cidrs6=(${tun_force_proxy_cidrs6[@]})
 fake_ip_range=""
 fake_ip6_range=""
 stack="${stack:-gvisor}"
@@ -279,6 +281,8 @@ runtime_save() {
     printf 'bypass_cn_ip="%s"\n' "${bypass_cn_ip}"
     printf 'bypass_cn_ip_v4="%s"\n' "${bypass_cn_ip_v4}"
     printf 'bypass_cn_ip_v6="%s"\n' "${bypass_cn_ip_v6}"
+    printf 'tun_force_proxy_cidrs=(%s)\n' "${tun_force_proxy_cidrs[*]}"
+    printf 'tun_force_proxy_cidrs6=(%s)\n' "${tun_force_proxy_cidrs6[*]}"
     printf 'box_user="%s"\n' "${box_user}"
     printf 'box_group="%s"\n' "${box_group}"
   } >"${runtime_iptables_env}" 2>/dev/null
@@ -1051,6 +1055,22 @@ append_tun_fake_ip_route_rules() {
 
   ensure_rule_append mangle "${chain_name}" -d "${fake_range}" -j MARK --set-xmark "${tun_route_mark}"
   ensure_rule_append mangle "${chain_name}" -d "${fake_range}" -j RETURN
+}
+
+append_tun_force_proxy_destination_rules() {
+  local chain_name="$1"
+
+  if [ "${iptables}" = "$IPV" ]; then
+    for subnet in ${tun_force_proxy_cidrs[@]} ; do
+      [ -n "${subnet}" ] || continue
+      append_mark_and_return_rule mangle "${chain_name}" "${tun_route_mark}" -d "${subnet}"
+    done
+  else
+    for subnet6 in ${tun_force_proxy_cidrs6[@]} ; do
+      [ -n "${subnet6}" ] || continue
+      append_mark_and_return_rule mangle "${chain_name}" "${tun_route_mark}" -d "${subnet6}"
+    done
+  fi
 }
 
 append_tun_bypass_destination_rules() {
@@ -2314,11 +2334,13 @@ start_tun_bypass() {
 
   ensure_rule_append mangle "${pre_chain}" -i "${tun_device}" -j RETURN
   append_tun_dns_rules "${pre_chain}"
+  append_tun_force_proxy_destination_rules "${pre_chain}"
   append_tun_bypass_destination_rules "${pre_chain}"
 
   append_tun_core_bypass_rules "${out_chain}"
   append_tun_dns_rules "${out_chain}"
   append_cnip_force_proxy_tun_rules "${out_chain}"
+  append_tun_force_proxy_destination_rules "${out_chain}"
   append_tun_proxy_mode_rules "${out_chain}"
   append_tun_bypass_destination_rules "${out_chain}"
 
