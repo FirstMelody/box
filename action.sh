@@ -11,14 +11,17 @@ run_as_su() {
 
 stop_service() {
     echo "服务正在关闭..."
-    run_as_su "${box_dir}/scripts/box.iptables disable"
-    run_as_su "${box_dir}/scripts/box.service stop"
+    run_as_su "${box_dir}/scripts/box.iptables disable" &
+    iptables_pid=$!
+    run_as_su "${box_dir}/scripts/box.service stop" &
+    service_pid=$!
+    wait "${iptables_pid}"
+    wait "${service_pid}"
 }
 
 start_service() {
     echo "服务正在启动，请稍候..."
-    run_as_su "${box_dir}/scripts/box.service start"
-    run_as_su "${box_dir}/scripts/box.iptables enable"
+    run_as_su "${box_dir}/scripts/box.service restart"
 }
 
 if [ -f "${box_pid}" ]; then

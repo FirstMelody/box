@@ -78,11 +78,14 @@ find_packages_uid() {
       ($1 in wanted) { print $1 " " $2 }
     ' "${request_file}" "${packages_file}" > "${map_file}"
 
-    while IFS=' ' read -r prefix package entry; do
+    busybox awk '
+      NR == FNR { uid[$1] = $2; next }
+      {
+        base_uid = ($2 in uid ? uid[$2] : "")
+        print $1 " " $2 " " $3 " " base_uid
+      }
+    ' "${map_file}" "${request_file}" | while IFS=' ' read -r prefix package entry base_uid; do
       [ -n "${package}" ] || continue
-
-      local base_uid
-      base_uid=$(busybox awk -v pkg="${package}" '$1 == pkg {print $2; exit}' "${map_file}" 2>/dev/null)
 
       case "${base_uid}" in
         ''|*[!0-9]*)
@@ -94,7 +97,7 @@ find_packages_uid() {
       local multiuser_uid=$((base_uid + prefix * 100000))
       echo "${multiuser_uid}" >> "${uid_list}"
       log Debug "用户 \"${prefix}\" 应用: \"${package}\" -> ${multiuser_uid}"
-    done < "${request_file}"
+    done
   elif [ -s "${request_file}" ]; then
     log Warning "Failure: packages.list 不存在: ${packages_file}"
   fi
@@ -135,7 +138,10 @@ box_check_logs() {
     done
     # 删除其他日志文件
     find "${box_run}" -maxdepth 1 -type f \( -name "root" -o -name "*.inotify.log" \) -exec rm -f {} +
-    find "${box_run_state}" -maxdepth 1 -type f \( -name "*.list" -a ! -name "appuid.list" \) -exec rm -f {} +
+    find "${box_run_state}" -maxdepth 1 -type f \( -name "*.list" \
+      -a ! -name "appuid.list" \
+      -a ! -name "force_proxy.uid.list" \
+      -a ! -name "cnip_force_proxy.uid.list" \) -exec rm -f {} +
     # 删除一天前的日志
     find "${box_run}" -maxdepth 1 -type f \( -name "*.log" -o -name "*.old.log" \) -mtime +1 -exec rm -f {} +
   ) &
@@ -1382,10 +1388,7 @@ case "$1" in
     stop_box
     ;;
   restart)
-    "${scripts_dir}/box.iptables" disable >/dev/null 2>&1 &
-    _r_ipt=$!
     stop_box
-    wait "${_r_ipt}" 2>/dev/null
 
     start_box &
     _r_sb=$!

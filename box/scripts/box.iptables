@@ -8,6 +8,7 @@ cnip_force_proxy_uid_list="${box_run_state}/cnip_force_proxy.uid.list"
 force_proxy_uid_list="${box_run_state}/force_proxy.uid.list"
 cap_cache_file="${box_run_state}/iptables.cap.env"
 ipset_stamp_dir="${box_run_state}/ipset.stamp"
+cap_cache_version="3"
 
 boxbpf_bin="${bin_dir}/boxbpf"
 ebpf_state_dir="${box_run_state}/ebpf"
@@ -44,6 +45,8 @@ tun_route_pref="99"
 # 是否通过 iptables 规则拦截 QUIC。开启后，部分仅支持 QUIC 的站点可能无法访问。
 quic=${quic:-"enable"}
 performance_mode=${performance_mode:-"false"}
+iptables_restore_batch=${iptables_restore_batch:-"false"}
+iptables_restore_timeout=${iptables_restore_timeout:-"3"}
 # 大陆IP分流匹配方式
 cnip_mode="${cnip_mode:-}"
 proxy_tcp=${proxy_tcp:-"true"}
@@ -192,11 +195,24 @@ cleanup_chain_fast() {
 
 # iptables-restore 批量下发
 restore_supported() {
+  case "${iptables_restore_batch}" in
+    true|auto) ;;
+    *) return 1 ;;
+  esac
+
   if [ "${iptables}" = "$IPV" ]; then
     [ "${cap_restore4}" = "true" ]
   else
     [ "${cap_restore6}" = "true" ]
   fi
+}
+
+restore_timeout_seconds() {
+  case "${iptables_restore_timeout}" in
+    ''|*[!0-9]*) printf '3\n' ;;
+    0) printf '1\n' ;;
+    *) printf '%s\n' "${iptables_restore_timeout}" ;;
+  esac
 }
 
 batch_buffer_file() {
@@ -281,15 +297,50 @@ batch_replay_live() {
 }
 
 # 把各表缓冲一次性提交（任何 live 命令前调用以保序）。失败回退逐条重放。
+run_restore_with_timeout() {
+  local payload_file="$1"
+  local timeout elapsed pid
+
+  timeout="$(restore_timeout_seconds)"
+  elapsed=0
+
+  ${box_batch_restore} -w "${timeout}" --noflush < "${payload_file}" >/dev/null 2>&1 &
+  pid=$!
+
+  while kill -0 "${pid}" >/dev/null 2>&1; do
+    if [ "${elapsed}" -ge "${timeout}" ]; then
+      kill -9 "${pid}" >/dev/null 2>&1 || true
+      wait "${pid}" 2>/dev/null || true
+      return 124
+    fi
+    busybox sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  wait "${pid}" 2>/dev/null
+}
+
+disable_restore_for_current_family() {
+  if [ "${iptables}" = "$IPV" ]; then
+    cap_restore4="false"
+  else
+    cap_restore6="false"
+  fi
+}
+
 flush_batch() {
   [ "${box_batch_active}" = "true" ] || return 0
-  local table f
+  local table f payload
   for table in ${box_batch_tables}; do
     f="$(batch_buffer_file "${table}")"
     [ -s "${f}" ] || continue
-    if ! { printf '*%s\n' "${table}"; cat "${f}"; printf 'COMMIT\n'; } | ${box_batch_restore} -w 100 --noflush >/dev/null 2>&1; then
+    payload="${box_run_state}/.batch.${table}.restore"
+    { printf '*%s\n' "${table}"; cat "${f}"; printf 'COMMIT\n'; } > "${payload}"
+    if ! run_restore_with_timeout "${payload}"; then
+      disable_restore_for_current_family
       batch_replay_live "${table}" "${f}"
     fi
+    rm -f "${payload}" >/dev/null 2>&1 || true
     : > "${f}"
   done
   box_batch_tables=""
@@ -305,14 +356,41 @@ end_batch() {
 
 probe_restore_support() {
   local family="$1"
-  local cmd ipt probe_chain="BOX_RESTORE_PROBE"
+  local cmd ipt probe_chain="BOX_RESTORE_PROBE" payload rc timeout elapsed pid
+
+  case "${iptables_restore_batch}" in
+    true|auto) ;;
+    *) return 1 ;;
+  esac
+
   if [ "${family}" = "6" ]; then
     cmd="ip6tables-restore"; ipt="$IP6V"
   else
     cmd="iptables-restore"; ipt="$IPV"
   fi
   command -v "${cmd}" >/dev/null 2>&1 || return 1
-  printf '*mangle\n:%s - [0:0]\nCOMMIT\n' "${probe_chain}" | ${cmd} -w 100 --noflush >/dev/null 2>&1 || return 1
+  payload="${box_run_state}/.restore_probe.${family}"
+  mkdir -p "${box_run_state}" >/dev/null 2>&1 || true
+  printf '*mangle\n:%s - [0:0]\nCOMMIT\n' "${probe_chain}" > "${payload}" || return 1
+
+  timeout="$(restore_timeout_seconds)"
+  elapsed=0
+  ${cmd} -w "${timeout}" --noflush < "${payload}" >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "${pid}" >/dev/null 2>&1; do
+    if [ "${elapsed}" -ge "${timeout}" ]; then
+      kill -9 "${pid}" >/dev/null 2>&1 || true
+      wait "${pid}" 2>/dev/null || true
+      rm -f "${payload}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    busybox sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "${pid}" 2>/dev/null
+  rc=$?
+  rm -f "${payload}" >/dev/null 2>&1 || true
+  [ "${rc}" -eq 0 ] || return 1
   ${ipt} -t mangle -F "${probe_chain}" >/dev/null 2>&1 || true
   ${ipt} -t mangle -X "${probe_chain}" >/dev/null 2>&1 || true
   return 0
@@ -508,6 +586,7 @@ load_capability_cache() {
 
   . "${cap_cache_file}" 2>/dev/null || return 1
 
+  [ "${cap_cache_file_version}" = "${cap_cache_version}" ] || return 1
   [ "${cap_cache_boot_id}" = "${current_boot}" ] || return 1
   [ -n "${cap_tproxy4}" ] || return 1
   [ -n "${cap_tproxy6}" ] || return 1
@@ -534,6 +613,7 @@ save_capability_cache() {
   mkdir -p "${box_run_state}" >/dev/null 2>&1 || true
 
   {
+    printf 'cap_cache_file_version="%s"\n' "${cap_cache_version}"
     printf 'cap_cache_boot_id="%s"\n' "${current_boot}"
     printf 'cap_tproxy4="%s"\n' "${cap_tproxy4}"
     printf 'cap_tproxy6="%s"\n' "${cap_tproxy6}"
@@ -1709,11 +1789,11 @@ append_cnip_force_proxy_local_rules() {
   local set_name=""
 
   [ "${bypass_cn_ip}" = "true" ] || return 0
-  cnip_force_proxy_uid_list_has_entries || return 0
   cnip_matcher_enabled_for_family || return 0
 
   # eBPF：force-uid 集合 + CN-CIDR 由 force pin 内部判定，单条 -m bpf 取代逐 UID 循环。
   if cnip_uses_ebpf; then
+    cnip_force_proxy_uid_list_has_entries || force_proxy_uid_list_has_entries || return 0
     local force_pin
     force_pin="$(cnip_force_ebpf_pin_path)"
     case "${action}" in
@@ -1733,6 +1813,8 @@ append_cnip_force_proxy_local_rules() {
     esac
     return 0
   fi
+
+  cnip_force_proxy_uid_list_has_entries || return 0
 
   if [ "${iptables}" = "$IPV" ]; then
     [ "${bypass_cn_ip_v4}" = "true" ] || return 0
@@ -3456,10 +3538,13 @@ write_rule_ebpf_config() {
   local app_uids="${ebpf_state_dir}/app-uids.txt"
   : > "${empty_v4}"
   : > "${empty_v6}"
-  if [ -s "${cnip_force_proxy_uid_list}" ]; then
-    cp "${cnip_force_proxy_uid_list}" "${force_uids}" 2>/dev/null || : > "${force_uids}"
-  else
-    : > "${force_uids}"
+  : > "${force_uids}"
+  [ -s "${force_proxy_uid_list}" ] && cat "${force_proxy_uid_list}" >> "${force_uids}" 2>/dev/null
+  [ -s "${cnip_force_proxy_uid_list}" ] && cat "${cnip_force_proxy_uid_list}" >> "${force_uids}" 2>/dev/null
+  if [ -s "${force_uids}" ]; then
+    local temp_force_uids="${ebpf_state_dir}/force-uids.sorted"
+    busybox sort -un "${force_uids}" > "${temp_force_uids}" 2>/dev/null && mv "${temp_force_uids}" "${force_uids}"
+    rm -f "${temp_force_uids}" >/dev/null 2>&1 || true
   fi
   local app_uid_path=""
   if app_uid_ebpf_requested && [ -s "${uid_list}" ]; then

@@ -21,11 +21,14 @@ write_inotify_error() {
 service_control() {
   if [ "${monitor_file}" = "disable" ]; then
     if [ "${events}" = "d" ]; then
-      "${service_path}" start > "${run_path}/inotify.log" 2>&1 &&
-      "${iptables_path}" enable >> "${run_path}/inotify.log" 2>&1
+      "${service_path}" restart > "${run_path}/inotify.log" 2>&1
     elif [ "${events}" = "n" ]; then
-      "${iptables_path}" disable >> "${run_path}/inotify.log" 2>&1 &&
-      "${service_path}" stop >> "${run_path}/inotify.log" 2>&1
+      "${iptables_path}" disable >> "${run_path}/inotify.log" 2>&1 &
+      iptables_pid=$!
+      "${service_path}" stop >> "${run_path}/inotify.log" 2>&1 &
+      service_pid=$!
+      wait "${iptables_pid}"
+      wait "${service_pid}"
     fi
   fi
 }
